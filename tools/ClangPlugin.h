@@ -13,11 +13,12 @@
 #include "clad/Differentiator/DiffPlanner.h"
 #include "clad/Differentiator/Version.h"
 
-#include "clang/AST/ASTConsumer.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/Basic/Version.h"
 #include "clang/Frontend/FrontendPluginRegistry.h"
+#include "clang/Frontend/MultiplexConsumer.h"
+#include "clang/Sema/SemaConsumer.h"
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
@@ -92,7 +93,7 @@ namespace clad {
       std::string CustomModelName;
     };
 
-    class CladPlugin : public clang::ASTConsumer {
+    class CladPlugin : public clang::SemaConsumer {
       clang::CompilerInstance& m_CI;
       DifferentiationOptions m_DO;
       std::unique_ptr<DerivativeBuilder> m_DerivativeBuilder;
@@ -101,13 +102,125 @@ namespace clad {
       bool m_HandleTopLevelDeclInternal = false;
       CladTimerGroup m_CTG;
       DerivedFnCollector m_DFC;
+      enum class CallKind {
+        HandleCXXStaticMemberVarInstantiation,
+        HandleTopLevelDecl,
+        HandleInlineFunctionDefinition,
+        HandleInterestingDecl,
+        HandleTagDeclDefinition,
+        HandleTagDeclRequiredDefinition,
+        HandleCXXImplicitFunctionInstantiation,
+        HandleTopLevelDeclInObjCContainer,
+        HandleImplicitImportDecl,
+        CompleteTentativeDefinition,
+        CompleteExternalDeclaration,
+        AssignInheritanceModel,
+        HandleVTable,
+        InitializeSema,
+        ForgetSema
+      };
+      struct DelayedCallInfo {
+        CallKind m_Kind;
+        clang::DeclGroupRef m_DGR;
+        DelayedCallInfo(CallKind K, clang::DeclGroupRef DGR)
+            : m_Kind(K), m_DGR(DGR) {}
+        DelayedCallInfo(CallKind K, const clang::Decl* D)
+            : m_Kind(K), m_DGR(const_cast<clang::Decl*>(D)) {}
+      };
+      std::vector<DelayedCallInfo> m_DelayedCalls;
+      std::unique_ptr<clang::MultiplexConsumer> m_Multiplexer;
+
     public:
       CladPlugin(clang::CompilerInstance& CI, DifferentiationOptions& DO);
       ~CladPlugin();
-      bool HandleTopLevelDecl(clang::DeclGroupRef DGR) override;
+      // ASTConsumer
+      void Initialize(clang::ASTContext& Context) override;
+      void HandleCXXStaticMemberVarInstantiation(clang::VarDecl* D) override {
+        AppendDelayed({CallKind::HandleCXXStaticMemberVarInstantiation, D});
+        m_Multiplexer->HandleCXXStaticMemberVarInstantiation(D);
+      }
+      bool HandleTopLevelDecl(clang::DeclGroupRef D) override; /*{
+        AppendDelayed({CallKind::HandleTopLevelDecl, D});
+        return true; // happyness, continue parsing
+        }*/
+      void HandleInlineFunctionDefinition(clang::FunctionDecl* D) override {
+        AppendDelayed({CallKind::HandleInlineFunctionDefinition, D});
+        m_Multiplexer->HandleInlineFunctionDefinition(D);
+      }
+      void HandleInterestingDecl(clang::DeclGroupRef D) override {
+        AppendDelayed({CallKind::HandleInterestingDecl, D});
+        m_Multiplexer->HandleInterestingDecl(D);
+      }
+      void HandleTagDeclDefinition(clang::TagDecl* D) override {
+        AppendDelayed({CallKind::HandleTagDeclDefinition, D});
+        m_Multiplexer->HandleTagDeclDefinition(D);
+      }
+      void HandleTagDeclRequiredDefinition(const clang::TagDecl* D) override {
+        AppendDelayed({CallKind::HandleTagDeclRequiredDefinition, D});
+        m_Multiplexer->HandleTagDeclRequiredDefinition(D);
+      }
+      void
+      HandleCXXImplicitFunctionInstantiation(clang::FunctionDecl* D) override {
+        AppendDelayed({CallKind::HandleCXXImplicitFunctionInstantiation, D});
+        m_Multiplexer->HandleCXXImplicitFunctionInstantiation(D);
+      }
+      void HandleTopLevelDeclInObjCContainer(clang::DeclGroupRef D) override {
+        AppendDelayed({CallKind::HandleTopLevelDeclInObjCContainer, D});
+        m_Multiplexer->HandleTopLevelDeclInObjCContainer(D);
+      }
+      void HandleImplicitImportDecl(clang::ImportDecl* D) override {
+        AppendDelayed({CallKind::HandleImplicitImportDecl, D});
+        m_Multiplexer->HandleImplicitImportDecl(D);
+      }
+      void CompleteTentativeDefinition(clang::VarDecl* D) override {
+        AppendDelayed({CallKind::CompleteTentativeDefinition, D});
+        m_Multiplexer->CompleteTentativeDefinition(D);
+      }
+#if CLANG_VERSION_MAJOR > 9
+      void CompleteExternalDeclaration(clang::VarDecl* D) override {
+        AppendDelayed({CallKind::CompleteExternalDeclaration, D});
+        m_Multiplexer->CompleteExternalDeclaration(D);
+      }
+#endif
+      void AssignInheritanceModel(clang::CXXRecordDecl* D) override {
+        AppendDelayed({CallKind::AssignInheritanceModel, D});
+        m_Multiplexer->AssignInheritanceModel(D);
+      }
+      void HandleVTable(clang::CXXRecordDecl* D) override {
+        AppendDelayed({CallKind::HandleVTable, D});
+        m_Multiplexer->HandleVTable(D);
+      }
+
+      // Not delayed.
+      void HandleTranslationUnit(clang::ASTContext& C) override {
+        m_Multiplexer->HandleTranslationUnit(C);
+      }
+      // No need to handle the listeners, they will be handled at non-delayed by
+      // the parent multiplexer.
+      //
+      // clang::ASTMutationListener *GetASTMutationListener() override;
+      // clang::ASTDeserializationListener *GetASTDeserializationListener()
+      // override;
+      void PrintStats() override { m_Multiplexer->PrintStats(); }
+      bool shouldSkipFunctionBody(clang::Decl* D) override {
+        return m_Multiplexer->shouldSkipFunctionBody(D);
+      }
+
+      // SemaConsumer
+      void InitializeSema(clang::Sema& S) override {
+        AppendDelayed({CallKind::InitializeSema, nullptr});
+        m_Multiplexer->InitializeSema(S);
+      }
+      void ForgetSema() override {
+        AppendDelayed({CallKind::ForgetSema, nullptr});
+        m_Multiplexer->ForgetSema();
+      }
+
+      // bool HandleTopLevelDecl(clang::DeclGroupRef DGR) override;
       clang::FunctionDecl* ProcessDiffRequest(DiffRequest& request);
 
     private:
+      void AppendDelayed(DelayedCallInfo DCI) { m_DelayedCalls.push_back(DCI); }
       bool CheckBuiltins();
       void ProcessTopLevelDecl(clang::Decl* D);
     };
@@ -190,7 +303,7 @@ namespace clad {
       }
 
       PluginASTAction::ActionType getActionType() override {
-        return AddBeforeMainAction;
+        return AddAfterMainAction;
       }
     };
   } // end namespace plugin

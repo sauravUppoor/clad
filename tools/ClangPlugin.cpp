@@ -91,11 +91,70 @@ namespace clad {
 
     CladPlugin::~CladPlugin() {}
 
+    // A facility allowing us to access the private member CurScope of the Sema
+    // object using standard-conforming C++.
+    namespace {
+    template <typename Tag, typename Tag::type M> struct Rob {
+      friend typename Tag::type get(Tag) { return M; }
+    };
+
+    template <typename Tag, typename Member> struct TagBase {
+      using type = Member;
+#ifdef MSVC
+#pragma warning(push, 0)
+#endif // MSVC
+#pragma GCC diagnostic push
+#ifdef __clang__
+#pragma clang diagnostic ignored "-Wunknown-warning-option"
+#endif // __clang__
+#pragma GCC diagnostic ignored "-Wnon-template-friend"
+      friend type get(Tag);
+#pragma GCC diagnostic pop
+#ifdef MSVC
+#pragma warning(pop)
+#endif // MSVC
+    };
+    // Tag used to access MultiplexConsumer::Consumers.
+    using namespace clang;
+    struct MultiplexConsumer_Consumers
+        : TagBase<
+              MultiplexConsumer_Consumers,
+              std::vector<std::unique_ptr<ASTConsumer>> MultiplexConsumer::*> {
+    };
+    template struct Rob<MultiplexConsumer_Consumers,
+                        &MultiplexConsumer::Consumers>;
+    } // namespace
+
+    void CladPlugin::Initialize(clang::ASTContext& C) {
+      // We know we have a multiplexer. We commit a sin here by stealing it and
+      // making the consumer pass-through so that we can delay all operations
+      // until clad is happy.
+
+      using namespace clang;
+
+      auto& MultiplexC = static_cast<MultiplexConsumer&>(m_CI.getASTConsumer());
+      auto& RobbedCs = MultiplexC.*get(MultiplexConsumer_Consumers());
+      assert(RobbedCs.back().get() == this && "Clad is not the last consumer");
+      std::vector<std::unique_ptr<ASTConsumer>> StolenConsumers;
+
+      // The range-based for loop in MultiplexConsumer::Initialize has
+      // dispatched this call. Generally, it is unsafe to delete elements while
+      // iterating but we know we are in the end of the loop and ::end() won't
+      // be invalidated.
+      for (auto& RC : RobbedCs)
+        if (RC.get() == this)
+          RobbedCs.erase(RobbedCs.begin(), RobbedCs.end() - 1);
+        else
+          StolenConsumers.push_back(std::move(RC));
+      m_Multiplexer.reset(new MultiplexConsumer(std::move(StolenConsumers)));
+    }
+
     // We cannot use HandleTranslationUnit because codegen already emits code on
     // HandleTopLevelDecl calls and makes updateCall with no effect.
     bool CladPlugin::HandleTopLevelDecl(DeclGroupRef DGR) {
+      AppendDelayed({CallKind::HandleTopLevelDecl, DGR});
       if (!CheckBuiltins())
-        return true;
+        return m_Multiplexer->HandleTopLevelDecl(DGR); // true;
 
       Sema& S = m_CI.getSema();
 
@@ -105,13 +164,13 @@ namespace clad {
       // if HandleTopLevelDecl was called through clad we don't need to process
       // it for diff requests
       if (m_HandleTopLevelDeclInternal)
-        return true;
+        return m_Multiplexer->HandleTopLevelDecl(DGR); // true;
 
       DiffSchedule requests{};
       DiffCollector collector(DGR, CladEnabledRange, requests, m_CI.getSema());
 
       if (requests.empty())
-        return true;
+        return m_Multiplexer->HandleTopLevelDecl(DGR); // true;
 
       // FIXME: flags have to be set manually since DiffCollector's constructor
       // does not have access to m_DO.
@@ -132,7 +191,8 @@ namespace clad {
 
       for (DiffRequest& request : requests)
         ProcessDiffRequest(request);
-      return true; // Happiness
+
+      return m_Multiplexer->HandleTopLevelDecl(DGR); // Happiness
     }
 
     void CladPlugin::ProcessTopLevelDecl(Decl* D) {
