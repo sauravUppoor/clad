@@ -93,6 +93,29 @@ namespace clad {
       std::string CustomModelName;
     };
 
+    class CladExternalSource : public clang::ExternalSemaSource {
+      // ExternalSemaSource
+      void ReadUndefinedButUsed(
+          llvm::MapVector<clang::NamedDecl*, clang::SourceLocation>& Undefined)
+          override {
+        // namespace { double f_darg0(double x); } will issue a warning that
+        // f_darg0 has internal linkage but is not defined. This is because we
+        // have not yet started to differentiate it. The warning is triggered by
+        // Sema::ActOnEndOfTranslationUnit before Clad is given control.
+        // To avoid the warning we should remove the entry from here.
+        using namespace clang;
+        Undefined.remove_if([](std::pair<NamedDecl*, SourceLocation> P) {
+          NamedDecl* ND = P.first;
+
+          if (!ND->getDeclName().isIdentifier())
+            return false;
+
+          // FIXME: We should replace this comparison with the canonical decl
+          // from the differentiation plan...
+          return ND->getName().contains("_darg");
+        });
+      }
+    };
     class CladPlugin : public clang::SemaConsumer {
       clang::CompilerInstance& m_CI;
       DifferentiationOptions m_DO;
@@ -213,12 +236,16 @@ namespace clad {
 
       // SemaConsumer
       void InitializeSema(clang::Sema& S) override {
+        // We are also a ExternalSemaSource.
+        S.addExternalSource(new CladExternalSource()); // Owned by Sema.
         AppendDelayed({CallKind::InitializeSema, nullptr});
       }
       void ForgetSema() override {
         AppendDelayed({CallKind::ForgetSema, nullptr});
       }
 
+      // FIXME: We should hide ProcessDiffRequest when we implement proper
+      // handling of the differentiation plans.
       clang::FunctionDecl* ProcessDiffRequest(DiffRequest& request);
 
     private:
